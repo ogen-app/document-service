@@ -1,0 +1,97 @@
+name: ci
+
+# Run tests on every PR and push; build and publish the image to Docker Hub once
+# tests pass, only on main or version tags (never on PRs / forks). Requires repo
+# secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN.
+#
+# Note: the documents.v1 contract lives in buf.build/ogen-app/proto (CON-220) and
+# the generated stubs are committed under gen/, so builds/tests need no buf. A
+# gen/-drift gate (mirroring pdf-service's `proto` job) can be added once
+# documents.v1 is published to that module (`make proto` pins the module version).
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+# Least-privilege default for GITHUB_TOKEN; jobs opt into more as needed.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l $(git ls-files '*.go' | grep -v '^gen/'))"
+          if [ -n "$unformatted" ]; then echo "needs gofmt:"; echo "$unformatted"; exit 1; fi
+
+      # All application logging goes through log/slog (CON-107). Boot log.Fatal*
+      # in cmd/documents-service is allowed; log.Print/Printf/Println are not.
+      - name: forbid stdlib log.Print calls
+        run: |
+          if git grep -nE 'log\.Print(ln|f)?\(' -- cmd internal; then
+            echo "::error::use log/slog, not the stdlib log.Print/Printf/Println functions"
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      # Pure Go — build the release binary exactly as the Dockerfile does.
+      - name: build (CGO-free)
+        run: CGO_ENABLED=0 go build ./...
+
+      - name: test
+        run: go test -race ./...
+
+  build-push:
+    runs-on: ubuntu-latest
+    # Gate the image on the tests: this job won't start until `test` succeeds.
+    # Skip on PRs and on forks.
+    needs: [test]
+    if: github.event_name == 'push' && github.repository_owner == 'ogen-app'
+    permissions:
+      contents: read
+      actions: write # read/write the type=gha buildx layer cache
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/document-service
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
