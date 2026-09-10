@@ -1,8 +1,13 @@
 name: ci
 
-# Lint + test on every PR and push. The image is built and pushed only after
-# both test jobs (go, proto) pass, and only on main or version tags — never on
-# PRs. Requires repo secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN.
+# Run tests on every PR and push; build and publish the image to Docker Hub once
+# tests pass, only on main or version tags (never on PRs / forks). Requires repo
+# secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN.
+#
+# Note: the documents.v1 contract lives in buf.build/ogen-app/proto (CON-220) and
+# the generated stubs are committed under gen/, so builds/tests need no buf. A
+# gen/-drift gate (mirroring pdf-service's `proto` job) can be added once
+# documents.v1 is published to that module (`make proto` pins the module version).
 on:
   push:
     branches: [main]
@@ -10,7 +15,7 @@ on:
   pull_request:
 
 jobs:
-  go:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,37 +49,11 @@ jobs:
       - name: test
         run: go test -race ./...
 
-  proto:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: bufbuild/buf-setup-action@v1
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      # Pin to the versions in the generated headers so regeneration is
-      # byte-identical. documents.v1 lives in buf.build/ogen-app/proto (CON-220);
-      # `make proto` requires that module version to publish documents.v1.
-      - name: Install protoc-gen-go plugins
-        run: |
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-      - name: Verify generated code is up to date
-        run: |
-          make proto
-          if [ -n "$(git status --porcelain -- gen/)" ]; then
-            echo "::error::gen/ is out of date — run 'make proto' and commit the result"
-            git diff -- gen/
-            exit 1
-          fi
-
   build-push:
     runs-on: ubuntu-latest
-    # Gate the image on tests: this job won't start until both go and proto
-    # succeed. Skip on PRs and on forks.
-    needs: [go, proto]
+    # Gate the image on the tests: this job won't start until `test` succeeds.
+    # Skip on PRs and on forks.
+    needs: [test]
     if: github.event_name == 'push' && github.repository_owner == 'ogen-app'
     steps:
       - uses: actions/checkout@v4
