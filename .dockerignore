@@ -4,5 +4,6 @@
 Dockerfile
 .dockerignore
 README.md
+MEMORY_TUNING.md
 *.out
 coverage.*
