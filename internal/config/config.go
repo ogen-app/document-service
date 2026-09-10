@@ -3,6 +3,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/kelseyhightower/envconfig"
@@ -49,6 +50,12 @@ func Load() (*Config, error) {
 	// Prefix it so the service binds all interfaces on that port.
 	if c.Listen != "" && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
+	}
+	// MemoryLimitRatio is a fraction of the cgroup limit; <=0 disables the derived
+	// GOMEMLIMIT (documented). A value > 1 would set GOMEMLIMIT *above* the hard
+	// cgroup limit, so the GC never leans in before an OOM kill — reject it.
+	if c.MemoryLimitRatio > 1 {
+		return nil, fmt.Errorf("DOCUMENTS_SERVICE_MEMORY_LIMIT_RATIO must be <= 1, got %v", c.MemoryLimitRatio)
 	}
 	return &c, nil
 }

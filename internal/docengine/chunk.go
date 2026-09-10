@@ -10,18 +10,18 @@ import (
 // dispatching on the document shape (PRD §8). Chunk sizing comes from opts, with
 // engine defaults when zero.
 func chunkBlocks(sh shape, blocks []Block, opts Options) []Chunk {
-	target, maxChars := resolveSizing(opts)
+	target, overlap, maxChars := resolveSizing(opts)
 	switch sh {
 	case shapeSheets:
 		return chunkSheets(blocks, target, maxChars)
 	case shapeSlides:
 		return chunkSlides(blocks, target, maxChars)
 	default:
-		return chunkProse(blocks, target, maxChars)
+		return chunkProse(blocks, target, overlap, maxChars)
 	}
 }
 
-func resolveSizing(opts Options) (target, maxChars int) {
+func resolveSizing(opts Options) (target, overlap, maxChars int) {
 	target = opts.TargetChars
 	if target <= 0 {
 		target = defaultTargetChars
@@ -33,14 +33,24 @@ func resolveSizing(opts Options) (target, maxChars int) {
 	if maxChars < target {
 		maxChars = target
 	}
-	return target, maxChars
+	overlap = opts.OverlapChars
+	if overlap < 0 {
+		overlap = 0
+	}
+	if overlap >= target {
+		overlap = target - 1 // overlap must be strictly less than a chunk's target
+	}
+	return target, overlap, maxChars
 }
 
 // chunkProse groups body blocks (paragraphs, list items, captions) under their
 // heading breadcrumb. A chunk is contiguous body under one heading path, split at
 // paragraph boundaries on overflow; the breadcrumb is prepended to every chunk so
-// each is self-describing (PRD §8). Headings maintain a level-indexed stack.
-func chunkProse(blocks []Block, target, maxChars int) []Chunk {
+// each is self-describing (PRD §8). When a section overflows, up to `overlap`
+// chars of its tail are carried into the next chunk so context isn't lost at the
+// split. No emitted Chunk.Text exceeds maxChars (the breadcrumb is included in
+// that bound).
+func chunkProse(blocks []Block, target, overlap, maxChars int) []Chunk {
 	// A prose stream carries one anchor kind (section for documents, email for
 	// .eml); take it from the body blocks so the kind survives chunking.
 	baseKind := AnchorSection
@@ -69,14 +79,16 @@ func chunkProse(blocks []Block, target, maxChars int) []Chunk {
 		if label != "" {
 			full = label + "\n\n" + text
 		}
-		full = validUTF8(full)
-		chunks = append(chunks, Chunk{
-			Index:       len(chunks),
-			Text:        full,
-			SourceLabel: label,
-			Anchor:      Anchor{Kind: baseKind, HeadingPath: append([]string(nil), curPath...)},
-			TokenCount:  estimateTokens(full),
-		})
+		// Enforce maxChars on the FINAL text (breadcrumb included), rune-safe.
+		for _, piece := range splitToMax(validUTF8(full), maxChars) {
+			chunks = append(chunks, Chunk{
+				Index:       len(chunks),
+				Text:        piece,
+				SourceLabel: label,
+				Anchor:      Anchor{Kind: baseKind, HeadingPath: append([]string(nil), curPath...)},
+				TokenCount:  estimateTokens(piece),
+			})
+		}
 		body = nil
 		bodyLen = 0
 	}
@@ -99,7 +111,13 @@ func chunkProse(blocks []Block, target, maxChars int) []Chunk {
 			return
 		}
 		if bodyLen > 0 && bodyLen+len(t) > target {
+			// Overflow within a section: carry the tail into the next chunk.
+			tail := overlapTail(strings.Join(body, "\n\n"), overlap)
 			flush()
+			if tail != "" {
+				body = append(body, tail)
+				bodyLen += len(tail)
+			}
 		}
 		body = append(body, t)
 		bodyLen += len(t)
@@ -108,7 +126,7 @@ func chunkProse(blocks []Block, target, maxChars int) []Chunk {
 	for _, b := range blocks {
 		switch b.Kind {
 		case BlockHeading:
-			flush() // a heading is a section boundary
+			flush() // a heading is a section boundary (no overlap across sections)
 			lvl := b.Level
 			if lvl < 1 {
 				lvl = 1
@@ -132,71 +150,72 @@ func chunkProse(blocks []Block, target, maxChars int) []Chunk {
 
 // chunkSheets serializes tabular data as labelled fields (never a raw grid),
 // groups rows to fill the budget without ever splitting a row, and emits one
-// summary chunk per sheet so "what's in this spreadsheet" is answerable (PRD §8).
-// Rows arrive in order; the first row of each sheet is treated as the header.
+// summary chunk per sheet (PRD §8). Cell ranges use each block's PHYSICAL row
+// number so they stay correct across blank rows the extractor skipped. No emitted
+// chunk exceeds maxChars.
 func chunkSheets(blocks []Block, target, maxChars int) []Chunk {
 	var chunks []Chunk
 	emit := func(text, label string, a Anchor) {
-		text = validUTF8(text)
-		chunks = append(chunks, Chunk{
-			Index:       len(chunks),
-			Text:        text,
-			SourceLabel: label,
-			Anchor:      a,
-			TokenCount:  estimateTokens(text),
-		})
+		for _, piece := range splitToMax(validUTF8(text), maxChars) {
+			chunks = append(chunks, Chunk{
+				Index:       len(chunks),
+				Text:        piece,
+				SourceLabel: label,
+				Anchor:      a,
+				TokenCount:  estimateTokens(piece),
+			})
+		}
 	}
 
 	for _, sheet := range groupBySheet(blocks) {
 		if len(sheet.rows) == 0 {
 			continue
 		}
-		header := sheet.rows[0]
+		header := sheet.rows[0].cells
 		dataRows := sheet.rows[1:]
-		lastCol := colLetter(maxLen(sheet.rows) - 1)
+		lastCol := colLetter(sheetMaxCols(sheet.rows) - 1)
+		firstRow := sheet.rows[0].row
+		lastRow := sheet.rows[len(sheet.rows)-1].row
 
 		// Summary chunk: name, columns, row count, a few sample rows.
 		emit(sheetSummary(sheet.name, header, dataRows), sheetLabel(sheet.name, "summary"),
-			Anchor{Kind: AnchorSheet, Sheet: sheet.name, CellRange: fmt.Sprintf("A1:%s%d", lastCol, len(sheet.rows))})
+			Anchor{Kind: AnchorSheet, Sheet: sheet.name, CellRange: fmt.Sprintf("A%d:%s%d", firstRow, lastCol, lastRow)})
 
 		// Data rows grouped to budget, never split.
 		var group []string
-		groupLen, startRow := 0, 0
-		flush := func(endRow int) {
+		groupLen, startRow, endRow := 0, 0, 0
+		flush := func() {
 			if len(group) == 0 {
 				return
 			}
 			rng := fmt.Sprintf("A%d:%s%d", startRow, lastCol, endRow)
-			label := sheetLabel(sheet.name, fmt.Sprintf("rows %d-%d", startRow, endRow))
-			emit(strings.Join(group, "\n"), label,
+			emit(strings.Join(group, "\n"), sheetLabel(sheet.name, fmt.Sprintf("rows %d-%d", startRow, endRow)),
 				Anchor{Kind: AnchorSheet, Sheet: sheet.name, CellRange: rng})
 			group = nil
 			groupLen = 0
 		}
-		for i, row := range dataRows {
-			rowNum := i + 2 // header is row 1
-			line := serializeRow(sheet.name, header, row)
+		for _, r := range dataRows {
+			line := serializeRow(sheet.name, header, r.cells)
 			if line == "" {
 				continue
 			}
 			if len(line) > maxChars {
-				flush(rowNum - 1)
-				for _, part := range hardSplit(line, maxChars) {
-					emit(part, sheetLabel(sheet.name, fmt.Sprintf("row %d", rowNum)),
-						Anchor{Kind: AnchorSheet, Sheet: sheet.name, CellRange: fmt.Sprintf("A%d:%s%d", rowNum, lastCol, rowNum)})
-				}
+				flush()
+				emit(line, sheetLabel(sheet.name, fmt.Sprintf("row %d", r.row)),
+					Anchor{Kind: AnchorSheet, Sheet: sheet.name, CellRange: fmt.Sprintf("A%d:%s%d", r.row, lastCol, r.row)})
 				continue
 			}
 			if groupLen > 0 && groupLen+len(line) > target {
-				flush(rowNum - 1)
+				flush()
 			}
 			if len(group) == 0 {
-				startRow = rowNum
+				startRow = r.row
 			}
+			endRow = r.row
 			group = append(group, line)
 			groupLen += len(line)
 		}
-		flush(len(sheet.rows))
+		flush()
 	}
 	return chunks
 }
@@ -217,14 +236,16 @@ func chunkSlides(blocks []Block, target, maxChars int) []Chunk {
 		if endSlide != startSlide {
 			label = fmt.Sprintf("Slides %d-%d", startSlide, endSlide)
 		}
-		text := validUTF8(strings.Join(buf, "\n\n"))
-		chunks = append(chunks, Chunk{
-			Index:       len(chunks),
-			Text:        text,
-			SourceLabel: label,
-			Anchor:      Anchor{Kind: AnchorSlide, Slide: startSlide},
-			TokenCount:  estimateTokens(text),
-		})
+		anchor := Anchor{Kind: AnchorSlide, Slide: startSlide}
+		for _, piece := range splitToMax(validUTF8(strings.Join(buf, "\n\n")), maxChars) {
+			chunks = append(chunks, Chunk{
+				Index:       len(chunks),
+				Text:        piece,
+				SourceLabel: label,
+				Anchor:      anchor,
+				TokenCount:  estimateTokens(piece),
+			})
+		}
 		buf = nil
 		bufLen = 0
 	}
@@ -235,15 +256,6 @@ func chunkSlides(blocks []Block, target, maxChars int) []Chunk {
 			continue
 		}
 		block := fmt.Sprintf("Slide %d\n%s", sl.num, text)
-		if len(block) > maxChars {
-			flush()
-			for _, part := range hardSplit(block, maxChars) {
-				startSlide, endSlide = sl.num, sl.num
-				buf = []string{part}
-				flush()
-			}
-			continue
-		}
 		if bufLen > 0 && bufLen+len(block) > target {
 			flush()
 		}
@@ -260,9 +272,14 @@ func chunkSlides(blocks []Block, target, maxChars int) []Chunk {
 
 // ---- sheet helpers ----
 
+type sheetRow struct {
+	cells []string
+	row   int // physical 1-based source row
+}
+
 type sheetGroup struct {
 	name string
-	rows [][]string
+	rows []sheetRow
 }
 
 func groupBySheet(blocks []Block) []sheetGroup {
@@ -279,7 +296,7 @@ func groupBySheet(blocks []Block) []sheetGroup {
 			idx[name] = i
 			groups = append(groups, sheetGroup{name: name})
 		}
-		groups[i].rows = append(groups[i].rows, b.Cells)
+		groups[i].rows = append(groups[i].rows, sheetRow{cells: b.Cells, row: b.Row})
 	}
 	return groups
 }
@@ -307,7 +324,7 @@ func serializeRow(sheet string, header, row []string) string {
 	return strings.Join(parts, " | ")
 }
 
-func sheetSummary(sheet string, header []string, dataRows [][]string) string {
+func sheetSummary(sheet string, header []string, dataRows []sheetRow) string {
 	var b strings.Builder
 	if sheet != "" {
 		fmt.Fprintf(&b, "Sheet %q — ", sheet)
@@ -327,7 +344,7 @@ func sheetSummary(sheet string, header []string, dataRows [][]string) string {
 		b.WriteString("\nSample rows:")
 		for _, r := range sample {
 			b.WriteString("\n")
-			b.WriteString(serializeRow(sheet, header, r))
+			b.WriteString(serializeRow(sheet, header, r.cells))
 		}
 	}
 	return b.String()
@@ -361,11 +378,11 @@ func colLetter(n int) string {
 	return s
 }
 
-func maxLen(rows [][]string) int {
+func sheetMaxCols(rows []sheetRow) int {
 	m := 0
 	for _, r := range rows {
-		if len(r) > m {
-			m = len(r)
+		if len(r.cells) > m {
+			m = len(r.cells)
 		}
 	}
 	return m
@@ -422,6 +439,15 @@ func validUTF8(s string) string {
 	return strings.ToValidUTF8(s, "�")
 }
 
+// splitToMax returns text unchanged when it fits maxChars, else rune-safe pieces
+// each within maxChars.
+func splitToMax(text string, maxChars int) []string {
+	if maxChars <= 0 || len(text) <= maxChars {
+		return []string{text}
+	}
+	return hardSplit(text, maxChars)
+}
+
 // hardSplit chops s into pieces of at most maxChars bytes, never splitting a
 // rune. Used for a pathological single paragraph/row larger than the budget.
 func hardSplit(s string, maxChars int) []string {
@@ -441,4 +467,25 @@ func hardSplit(s string, maxChars int) []string {
 		parts = append(parts, s)
 	}
 	return parts
+}
+
+// overlapTail returns up to n trailing chars of s, snapped to a rune boundary and
+// (where possible) starting after a whitespace so the carry-over doesn't begin
+// mid-word. Empty when n <= 0.
+func overlapTail(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return strings.TrimSpace(s)
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	tail := s[start:]
+	if i := strings.IndexAny(tail, " \n\t"); i >= 0 && i < len(tail)-1 {
+		tail = tail[i+1:]
+	}
+	return strings.TrimSpace(tail)
 }

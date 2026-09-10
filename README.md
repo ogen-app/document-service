@@ -14,21 +14,30 @@ stores them in `assets_chunks`. Reached **only** over the Railway private networ
 
 ## Contract
 
-The canonical proto lives here: `proto/documents/v1/documents.proto`. Generated
-Go stubs are committed under `gen/` so `go build` needs no `buf`. Regenerate with
-`make proto` (runs `buf lint` + `buf generate`). Ogen consumes the same contract
-via its own committed `gen/documents/v1` (generated from this file); once
-`documents.v1` is mirrored into `buf.build/ogen-app/proto` (CON-220), both repos
-generate from the pinned module instead.
+The `documents.v1` contract lives in the shared **`buf.build/ogen-app/proto`**
+module (CON-220), not in this repo. Generated Go stubs are committed under `gen/`
+so `go build` needs no `buf`; `make proto` regenerates them from a pinned module
+version (`buf generate`). Ogen consumes the same contract via its own committed
+`gen/documents/v1`, so both repos generate from the identical pinned module.
 
 ## Status
 
-- **v0 (skeleton):** streaming server, health, structured logging, cgroup-aware
-  runtime tuning, concurrency cap, and a working **plain-text** extractor. All
-  other formats return a terminal `Unimplemented` today.
-- **Next (the format matrix):** magic-byte detection + per-family extractors
-  (OOXML `.docx/.pptx/.xlsx`, ODF, EPUB, CSV/TSV, HTML, EML, RTF) emitting a
-  normalized `Block` stream, and a per-shape anchored chunker.
+Implemented: magic-byte format detection and a per-family extraction engine that
+normalises every format to a `Block` stream, then a per-shape anchored chunker
+(prose heading-breadcrumb / spreadsheet labelled-fields + per-sheet summary /
+atomic slides). Supported formats:
+
+| Shape | Formats |
+| -- | -- |
+| Prose | `.docx`, `.odt`, `.epub`, `.html`/`.xhtml`, `.rtf`, `.txt`/`.log`, `.eml` |
+| Spreadsheet | `.xlsx`, `.ods`, `.csv`/`.tsv` |
+| Slides | `.pptx`, `.odp` |
+
+Each chunk carries a `source_label` + structured `Anchor` (page/slide/sheet+cell
+range/heading path/email). Legacy OLE2 binaries (`.doc/.xls/.ppt`) and unknown
+formats return a terminal `Unimplemented`; corrupt/malformed input returns
+`InvalidArgument`. Extraction streams the underlying XML and bounds zip
+decompression so a hostile upload can't exhaust memory.
 
 ## Configuration
 

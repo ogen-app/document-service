@@ -64,11 +64,19 @@ func extractHTML(data []byte) ([]Block, error) {
 	return blocks, nil
 }
 
-// textContent concatenates all descendant text of n.
+// textContent concatenates all descendant text of n, skipping non-content
+// subtrees (script/style/noscript/template) even when nested inside a block
+// element — otherwise script source inside a paragraph would become document text.
 func textContent(n *html.Node) string {
 	var b strings.Builder
 	var rec func(*html.Node)
 	rec = func(x *html.Node) {
+		if x.Type == html.ElementNode {
+			switch x.DataAtom {
+			case atom.Script, atom.Style, atom.Noscript, atom.Template:
+				return
+			}
+		}
 		if x.Type == html.TextNode {
 			b.WriteString(x.Data)
 		}

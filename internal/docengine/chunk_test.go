@@ -13,7 +13,7 @@ func TestChunkProse_BreadcrumbAndSectionBoundary(t *testing.T) {
 		{Kind: BlockHeading, Level: 2, Text: "Billing"},
 		{Kind: BlockParagraph, Text: "Invoices monthly."},
 	}
-	chunks := chunkProse(blocks, 5000, 6000)
+	chunks := chunkProse(blocks, 5000, 0, 6000)
 	if len(chunks) != 2 {
 		t.Fatalf("want 2 section chunks, got %d", len(chunks))
 	}
@@ -35,7 +35,7 @@ func TestChunkProse_SplitsLongSectionAtParagraphBoundary(t *testing.T) {
 		{Kind: BlockParagraph, Text: p},
 		{Kind: BlockParagraph, Text: p},
 	}
-	chunks := chunkProse(blocks, 500, 1000)
+	chunks := chunkProse(blocks, 500, 0, 1000)
 	if len(chunks) != 2 {
 		t.Fatalf("want 2 chunks when the section exceeds target, got %d", len(chunks))
 	}
@@ -45,11 +45,32 @@ func TestChunkProse_SplitsLongSectionAtParagraphBoundary(t *testing.T) {
 	}
 }
 
+func TestChunkProse_OverlapCarriesTail(t *testing.T) {
+	blocks := []Block{
+		{Kind: BlockHeading, Level: 1, Text: "H"},
+		{Kind: BlockParagraph, Text: "alpha bravo charlie"},
+		{Kind: BlockParagraph, Text: "delta echo foxtrot"},
+	}
+	// Zero overlap: the two paragraphs land in separate chunks with no carry-over.
+	zero := chunkProse(blocks, 25, 0, 1000)
+	if len(zero) != 2 || strings.Contains(zero[1].Text, "charlie") {
+		t.Fatalf("zero-overlap chunk2 should not repeat the tail: %q", zero[1].Text)
+	}
+	// Nonzero overlap: the tail of chunk 1 is carried into chunk 2.
+	over := chunkProse(blocks, 25, 12, 1000)
+	if len(over) != 2 {
+		t.Fatalf("want 2 chunks, got %d", len(over))
+	}
+	if !strings.Contains(over[1].Text, "charlie") {
+		t.Fatalf("nonzero-overlap chunk2 should carry the previous tail: %q", over[1].Text)
+	}
+}
+
 func TestChunkSheets_NeverSplitsRowAndSummaryFirst(t *testing.T) {
 	blocks := []Block{
-		{Kind: BlockSheetRow, Cells: []string{"Region", "ACV"}, Anchor: Anchor{Kind: AnchorSheet, Sheet: "Q3"}},
-		{Kind: BlockSheetRow, Cells: []string{"EMEA", "41200"}, Anchor: Anchor{Kind: AnchorSheet, Sheet: "Q3"}},
-		{Kind: BlockSheetRow, Cells: []string{"APAC", "80000"}, Anchor: Anchor{Kind: AnchorSheet, Sheet: "Q3"}},
+		{Kind: BlockSheetRow, Cells: []string{"Region", "ACV"}, Row: 1, Anchor: Anchor{Kind: AnchorSheet, Sheet: "Q3"}},
+		{Kind: BlockSheetRow, Cells: []string{"EMEA", "41200"}, Row: 2, Anchor: Anchor{Kind: AnchorSheet, Sheet: "Q3"}},
+		{Kind: BlockSheetRow, Cells: []string{"APAC", "80000"}, Row: 5, Anchor: Anchor{Kind: AnchorSheet, Sheet: "Q3"}},
 	}
 	// Tiny target forces each row into its own chunk, but a row is never split.
 	chunks := chunkSheets(blocks, 10, 10000)

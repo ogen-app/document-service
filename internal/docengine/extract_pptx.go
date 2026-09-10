@@ -2,6 +2,7 @@ package docengine
 
 import (
 	"archive/zip"
+	"context"
 	"encoding/xml"
 	"errors"
 	"io"
@@ -15,7 +16,7 @@ import (
 // filename order is not presentation order after edits, PRD §8). Each slide's
 // visible text (all <a:t> runs) becomes a slide-body block; the slides chunker
 // keeps slides atomic.
-func extractPptx(data []byte) ([]Block, error) {
+func extractPptx(ctx context.Context, data []byte) ([]Block, error) {
 	zr, err := openZip(data)
 	if err != nil {
 		return nil, err
@@ -27,6 +28,9 @@ func extractPptx(data []byte) ([]Block, error) {
 	var blocks []Block
 	slideNum := 0
 	for _, part := range order {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		text := pptSlideText(zr, part)
 		slideNum++
 		if strings.TrimSpace(text) == "" {

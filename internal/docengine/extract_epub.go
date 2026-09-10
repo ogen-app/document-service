@@ -2,6 +2,7 @@ package docengine
 
 import (
 	"archive/zip"
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -12,8 +13,10 @@ import (
 
 // extractEpub reads an EPUB's spine in reading order and extracts each XHTML
 // chapter via the HTML extractor, concatenating the prose blocks. The spine order
-// (not the zip order) is authoritative.
-func extractEpub(data []byte) ([]Block, error) {
+// (not the zip order) is authoritative. A shared uncompressed-byte budget
+// (maxArchiveBytes) caps the whole extraction — the per-entry zip cap alone would
+// let a many-chapter book decompress without bound.
+func extractEpub(ctx context.Context, data []byte) ([]Block, error) {
 	zr, err := openZip(data)
 	if err != nil {
 		return nil, err
@@ -26,7 +29,11 @@ func extractEpub(data []byte) ([]Block, error) {
 	baseDir := path.Dir(opfPath)
 
 	var blocks []Block
+	var total int64
 	for _, idref := range spine {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		href, ok := manifest[idref]
 		if !ok {
 			continue
@@ -45,6 +52,9 @@ func extractEpub(data []byte) ([]Block, error) {
 		}
 		body, _ := io.ReadAll(rc)
 		_ = rc.Close()
+		if total += int64(len(body)); total > maxArchiveBytes {
+			return nil, fmt.Errorf("%w: epub exceeds %d decompressed bytes", ErrInvalid, maxArchiveBytes)
+		}
 		chapter, err := extractHTML(body)
 		if err != nil {
 			continue // best-effort: skip an unparseable chapter

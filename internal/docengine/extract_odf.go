@@ -1,6 +1,7 @@
 package docengine
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -11,7 +12,13 @@ import (
 
 // ODF (.odt/.ods/.odp) is a zip whose content.xml holds the body in the
 // OpenDocument XML. The three sub-formats share the tokenizer but map to the
-// three document shapes: odt=prose, ods=sheets, odp=slides.
+// three document shapes: odt=prose, ods=sheets, odp=slides. A non-EOF decoder
+// error (malformed/truncated content.xml) is returned as ErrInvalid rather than
+// silently yielding a partial document.
+
+// maxSheetCols bounds a single row's materialised width (Excel's max is 16384),
+// so a hostile number-columns-repeated can't blow up a row.
+const maxSheetCols = 8192
 
 // odfContentReader opens content.xml from an ODF archive.
 func odfContentReader(data []byte) (io.ReadCloser, error) {
@@ -32,7 +39,7 @@ func odfContentReader(data []byte) (io.ReadCloser, error) {
 
 // extractOdt streams an OpenDocument Text body into prose blocks: text:h ->
 // heading (text:outline-level = depth), text:p -> paragraph.
-func extractOdt(data []byte) ([]Block, error) {
+func extractOdt(ctx context.Context, data []byte) ([]Block, error) {
 	rc, err := odfContentReader(data)
 	if err != nil {
 		return nil, err
@@ -47,10 +54,18 @@ func extractOdt(data []byte) ([]Block, error) {
 		heading   bool
 		level     int
 	)
-	for {
+	for i := 0; ; i++ {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		tok, err := dec.Token()
-		if errors.Is(err, io.EOF) || err != nil {
+		if errors.Is(err, io.EOF) {
 			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: malformed odt xml: %v", ErrInvalid, err)
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
@@ -96,9 +111,10 @@ func extractOdt(data []byte) ([]Block, error) {
 }
 
 // extractOds streams an OpenDocument Spreadsheet into SheetRow blocks. Computed
-// numeric values come from office:value (not the formula); repeated empty cells
-// (number-columns-repeated) are not expanded.
-func extractOds(data []byte) ([]Block, error) {
+// numeric values come from office:value (not the formula). number-columns-repeated
+// and number-rows-repeated are honoured so column and physical-row positions stay
+// accurate without materialising huge empty runs.
+func extractOds(ctx context.Context, data []byte) ([]Block, error) {
 	rc, err := odfContentReader(data)
 	if err != nil {
 		return nil, err
@@ -109,25 +125,40 @@ func extractOds(data []byte) ([]Block, error) {
 	var (
 		blocks    []Block
 		sheet     string
-		cells     []string
+		row       []string
+		col       int // running 0-based column cursor within the row (honours repeats)
+		physRow   int // last physical 1-based row consumed within the sheet
+		curRow    int // physical 1-based row of the row currently being built
 		cell      strings.Builder
 		inCell    bool
 		repeat    int
 		valueAttr string
 		valueType string
 	)
-	for {
+	for i := 0; ; i++ {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		tok, err := dec.Token()
-		if errors.Is(err, io.EOF) || err != nil {
+		if errors.Is(err, io.EOF) {
 			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: malformed ods xml: %v", ErrInvalid, err)
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
 			switch t.Name.Local {
 			case "table":
 				sheet = attrValue(t, "name")
+				physRow = 0
 			case "table-row":
-				cells = nil
+				row, col = nil, 0
+				rowRepeat := atoiOr(attrValue(t, "number-rows-repeated"), 1)
+				curRow = physRow + 1 // first physical row of this (possibly repeated) group
+				physRow += rowRepeat
 			case "table-cell", "covered-table-cell":
 				inCell = true
 				cell.Reset()
@@ -147,11 +178,11 @@ func extractOds(data []byte) ([]Block, error) {
 				if valueAttr != "" && isNumericValueType(valueType) {
 					val = valueAttr
 				}
-				cells = appendRepeated(cells, validUTF8(val), repeat)
+				row, col = placeCell(row, col, validUTF8(val), repeat)
 			case "table-row":
-				row := trimTrailingEmpty(cells)
-				if len(row) > 0 {
-					blocks = append(blocks, Block{Kind: BlockSheetRow, Cells: row, Anchor: Anchor{Kind: AnchorSheet, Sheet: sheet}})
+				cells := trimTrailingEmpty(row)
+				if len(cells) > 0 {
+					blocks = append(blocks, Block{Kind: BlockSheetRow, Cells: cells, Row: curRow, Anchor: Anchor{Kind: AnchorSheet, Sheet: sheet}})
 				}
 			}
 		}
@@ -161,7 +192,7 @@ func extractOds(data []byte) ([]Block, error) {
 
 // extractOdp streams an OpenDocument Presentation into slide blocks, one per
 // draw:page in document order.
-func extractOdp(data []byte) ([]Block, error) {
+func extractOdp(ctx context.Context, data []byte) ([]Block, error) {
 	rc, err := odfContentReader(data)
 	if err != nil {
 		return nil, err
@@ -175,10 +206,18 @@ func extractOdp(data []byte) ([]Block, error) {
 		inPage   bool
 		slideNum int
 	)
-	for {
+	for i := 0; ; i++ {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		tok, err := dec.Token()
-		if errors.Is(err, io.EOF) || err != nil {
+		if errors.Is(err, io.EOF) {
 			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: malformed odp xml: %v", ErrInvalid, err)
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
@@ -219,28 +258,25 @@ func appendProse(blocks []Block, kind BlockKind, level int, text string) []Block
 	return append(blocks, Block{Kind: kind, Level: level, Text: text, Anchor: Anchor{Kind: AnchorSection}})
 }
 
-// appendRepeated appends val `repeat` times, but never expands repeated EMPTY
-// cells (ODF pads trailing/blank cells with huge number-columns-repeated counts),
-// and caps a non-empty repeat so a hostile file can't blow up the row.
-func appendRepeated(cells []string, val string, repeat int) []string {
+// placeCell writes a cell value at the running column cursor, honouring
+// number-columns-repeated. It materialises leading empties only up to a non-empty
+// cell's column (bounded by maxSheetCols), so the true column offset of real data
+// is preserved without expanding huge trailing empty runs, then advances the
+// cursor by the full repeat. Empty cells contribute no data but still move the
+// cursor, keeping later columns correctly positioned.
+func placeCell(row []string, col int, val string, repeat int) ([]string, int) {
 	if repeat < 1 {
 		repeat = 1
 	}
-	if val == "" {
-		if repeat <= 64 {
-			for range repeat {
-				cells = append(cells, "")
-			}
+	if val != "" {
+		for len(row) < col && len(row) < maxSheetCols {
+			row = append(row, "")
 		}
-		return cells
+		for i := 0; i < repeat && len(row) < maxSheetCols; i++ {
+			row = append(row, val)
+		}
 	}
-	if repeat > 1024 {
-		repeat = 1024
-	}
-	for range repeat {
-		cells = append(cells, val)
-	}
-	return cells
+	return row, col + repeat
 }
 
 func isNumericValueType(t string) bool {

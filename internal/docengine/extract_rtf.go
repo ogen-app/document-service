@@ -31,33 +31,44 @@ func extractRtf(data []byte) ([]Block, error) {
 type rtfFrame struct {
 	ignore     bool
 	firstToken bool // next control word may name a destination to skip
+	uc         int  // \ucN: chars of fallback text following a \u to skip (default 1)
 }
 
 func rtfToText(s string) string {
 	var out strings.Builder
-	stack := []rtfFrame{{}}
+	stack := []rtfFrame{{uc: 1}}
 	top := func() *rtfFrame { return &stack[len(stack)-1] }
 
+	// skip counts fallback characters to drop after a \uN so the ANSI substitute
+	// (e.g. "?") doesn't appear alongside the decoded Unicode rune.
+	skip := 0
 	i, n := 0, len(s)
 	for i < n {
 		switch c := s[i]; c {
 		case '{':
-			stack = append(stack, rtfFrame{ignore: top().ignore, firstToken: true})
+			stack = append(stack, rtfFrame{ignore: top().ignore, firstToken: true, uc: top().uc})
+			skip = 0
 			i++
 		case '}':
 			if len(stack) > 1 {
 				stack = stack[:len(stack)-1]
 			}
+			skip = 0
 			i++
 		case '\\':
 			if i+1 >= n {
 				i++
 				continue
 			}
-			i = rtfControl(&out, top(), s, i, n)
+			i = rtfControl(&out, top(), s, i, n, &skip)
 		case '\r', '\n':
 			i++ // raw line breaks aren't content in RTF
 		default:
+			if skip > 0 {
+				skip-- // this is \u fallback text — drop it
+				i++
+				continue
+			}
 			if !top().ignore {
 				out.WriteByte(c)
 			}
@@ -69,9 +80,14 @@ func rtfToText(s string) string {
 }
 
 // rtfControl handles the token starting at s[i]=='\\' and returns the next index.
-func rtfControl(out *strings.Builder, fr *rtfFrame, s string, i, n int) int {
+// skip tracks pending \u fallback characters to drop.
+func rtfControl(out *strings.Builder, fr *rtfFrame, s string, i, n int, skip *int) int {
 	switch next := s[i+1]; next {
 	case '\\', '{', '}':
+		if *skip > 0 {
+			*skip--
+			return i + 2
+		}
 		if !fr.ignore {
 			out.WriteByte(next)
 		}
@@ -82,7 +98,9 @@ func rtfControl(out *strings.Builder, fr *rtfFrame, s string, i, n int) int {
 		return i + 2
 	case '\'':
 		if i+3 < n {
-			if !fr.ignore {
+			if *skip > 0 {
+				*skip-- // \'xx as \u fallback
+			} else if !fr.ignore {
 				out.WriteRune(rune(hexByte(s[i+2], s[i+3])))
 			}
 			fr.firstToken = false
@@ -112,18 +130,29 @@ func rtfControl(out *strings.Builder, fr *rtfFrame, s string, i, n int) int {
 			fr.ignore = true
 		}
 		fr.firstToken = false
-		if !fr.ignore {
-			switch word {
-			case "par", "line", "sect", "pard":
-				out.WriteByte('\n')
-			case "tab":
-				out.WriteByte('\t')
-			case "u":
-				if cp, err := strconv.Atoi(param); err == nil {
-					if cp < 0 {
-						cp += 65536
-					}
+		switch word {
+		case "uc":
+			// \ucN sets how many fallback chars follow each subsequent \u.
+			if v, err := strconv.Atoi(param); err == nil && v >= 0 {
+				fr.uc = v
+			}
+		case "u":
+			if cp, err := strconv.Atoi(param); err == nil {
+				if cp < 0 {
+					cp += 65536
+				}
+				if !fr.ignore {
 					out.WriteRune(rune(cp))
+				}
+				*skip = fr.uc // drop the ANSI fallback that follows
+			}
+		default:
+			if !fr.ignore {
+				switch word {
+				case "par", "line", "sect", "pard":
+					out.WriteByte('\n')
+				case "tab":
+					out.WriteByte('\t')
 				}
 			}
 		}

@@ -2,6 +2,7 @@ package docengine
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 
 	"github.com/xuri/excelize/v2"
@@ -10,9 +11,10 @@ import (
 // extractXlsx parses a .xlsx into SheetRow blocks using excelize's streaming row
 // iterator (PRD: take excelize, use Rows() not GetRows()). It reads COMPUTED cell
 // values (not formula strings), skips hidden and fully-empty sheets, and drops
-// blank rows. The sheets chunker then serializes rows as labelled fields and
-// emits a per-sheet summary.
-func extractXlsx(data []byte) ([]Block, error) {
+// blank rows — recording each block's PHYSICAL 1-based row so the chunker's cell
+// ranges stay accurate across skipped blanks. The sheets chunker then serializes
+// rows as labelled fields and emits a per-sheet summary.
+func extractXlsx(ctx context.Context, data []byte) ([]Block, error) {
 	f, err := excelize.OpenReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("%w: open xlsx: %v", ErrInvalid, err)
@@ -28,7 +30,13 @@ func extractXlsx(data []byte) ([]Block, error) {
 		if err != nil {
 			continue // unreadable sheet: best-effort, skip it
 		}
+		physRow := 0
 		for rows.Next() {
+			physRow++ // physical row incl. blanks, so ranges match the real sheet
+			if err := ctx.Err(); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
 			cols, err := rows.Columns() // computed values, as strings
 			if err != nil {
 				break
@@ -40,7 +48,7 @@ func extractXlsx(data []byte) ([]Block, error) {
 			for i, c := range cols {
 				cells[i] = validUTF8(c)
 			}
-			blocks = append(blocks, Block{Kind: BlockSheetRow, Cells: cells, Anchor: Anchor{Kind: AnchorSheet, Sheet: name}})
+			blocks = append(blocks, Block{Kind: BlockSheetRow, Cells: cells, Row: physRow, Anchor: Anchor{Kind: AnchorSheet, Sheet: name}})
 		}
 		_ = rows.Close()
 	}

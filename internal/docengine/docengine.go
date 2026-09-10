@@ -10,7 +10,10 @@
 // bounds decompression so a hostile upload can't OOM the pod (PRD §12).
 package docengine
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // Sentinel errors classify a failure as terminal at the gRPC boundary (see the
 // server's mapEngineErr). ErrUnsupported -> Unimplemented (convert the file);
@@ -92,15 +95,22 @@ type Engine struct{}
 // New constructs an Engine.
 func New() *Engine { return &Engine{} }
 
-// Extract detects the format of data and returns its anchored chunks. It never
-// panics on hostile input: unrecognised/unhandled formats return ErrUnsupported,
-// empty/corrupt input returns ErrInvalid.
+// Extract is ExtractContext with a background context (kept for callers/tests
+// that don't need cancellation).
 func (e *Engine) Extract(data []byte, opts Options) (*Result, error) {
+	return e.ExtractContext(context.Background(), data, opts)
+}
+
+// ExtractContext detects the format of data and returns its anchored chunks. It
+// never panics on hostile input: unrecognised/unhandled formats return
+// ErrUnsupported, empty/corrupt input returns ErrInvalid. ctx cancellation stops
+// the bounded parser loops so an abandoned request stops consuming CPU.
+func (e *Engine) ExtractContext(ctx context.Context, data []byte, opts Options) (*Result, error) {
 	format, fam, err := detect(data, hintFrom(opts))
 	if err != nil {
 		return nil, err
 	}
-	sh, blocks, err := extract(fam, format, data)
+	sh, blocks, err := extract(ctx, fam, format, data)
 	if err != nil {
 		return nil, err
 	}
@@ -110,37 +120,39 @@ func (e *Engine) Extract(data []byte, opts Options) (*Result, error) {
 // extract dispatches to the family's extractor, returning the document shape and
 // its Block stream. Detected-but-unimplemented families return a precise
 // ErrUnsupported so the message names the format.
-func extract(fam family, format string, data []byte) (shape, []Block, error) {
+func extract(ctx context.Context, fam family, format string, data []byte) (shape, []Block, error) {
 	switch fam {
 	case familyText:
 		return shapeProse, extractText(data), nil
 	case familyCSV:
-		return shapeSheets, extractDelimited(data, ','), nil
+		blocks, err := extractDelimited(ctx, data, ',')
+		return shapeSheets, blocks, err
 	case familyTSV:
-		return shapeSheets, extractDelimited(data, '\t'), nil
+		blocks, err := extractDelimited(ctx, data, '\t')
+		return shapeSheets, blocks, err
 	case familyHTML:
 		blocks, err := extractHTML(data)
 		return shapeProse, blocks, err
 	case familyDOCX:
-		blocks, err := extractDocx(data)
+		blocks, err := extractDocx(ctx, data)
 		return shapeProse, blocks, err
 	case familyXLSX:
-		blocks, err := extractXlsx(data)
+		blocks, err := extractXlsx(ctx, data)
 		return shapeSheets, blocks, err
 	case familyPPTX:
-		blocks, err := extractPptx(data)
+		blocks, err := extractPptx(ctx, data)
 		return shapeSlides, blocks, err
 	case familyODT:
-		blocks, err := extractOdt(data)
+		blocks, err := extractOdt(ctx, data)
 		return shapeProse, blocks, err
 	case familyODS:
-		blocks, err := extractOds(data)
+		blocks, err := extractOds(ctx, data)
 		return shapeSheets, blocks, err
 	case familyODP:
-		blocks, err := extractOdp(data)
+		blocks, err := extractOdp(ctx, data)
 		return shapeSlides, blocks, err
 	case familyEPUB:
-		blocks, err := extractEpub(data)
+		blocks, err := extractEpub(ctx, data)
 		return shapeProse, blocks, err
 	case familyEML:
 		blocks, err := extractEml(data)

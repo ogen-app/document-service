@@ -1,6 +1,7 @@
 package docengine
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -14,7 +15,7 @@ import (
 // tens of MB, PRD §12), tracking paragraph style so Heading N / Title map to
 // heading blocks and numbered/bulleted paragraphs to list items. Table cells are
 // captured as paragraphs in v1 (structured table serialization is a follow-up).
-func extractDocx(data []byte) ([]Block, error) {
+func extractDocx(ctx context.Context, data []byte) ([]Block, error) {
 	zr, err := openZip(data)
 	if err != nil {
 		return nil, err
@@ -28,13 +29,14 @@ func extractDocx(data []byte) ([]Block, error) {
 		return nil, fmt.Errorf("%w: open docx body: %v", ErrInvalid, err)
 	}
 	defer rc.Close()
-	return parseWordXML(rc)
+	return parseWordXML(ctx, rc)
 }
 
 // parseWordXML streams the WordprocessingML body. Element local names are matched
 // (ignoring the w: namespace): p=paragraph, t=text run, tab/br/cr=whitespace,
-// pStyle=paragraph style, numPr=list marker.
-func parseWordXML(r io.Reader) ([]Block, error) {
+// pStyle=paragraph style, numPr=list marker. A non-EOF decoder error (malformed
+// XML) is returned as ErrInvalid rather than silently truncating the document.
+func parseWordXML(ctx context.Context, r io.Reader) ([]Block, error) {
 	dec := xml.NewDecoder(r)
 	var (
 		blocks   []Block
@@ -62,14 +64,18 @@ func parseWordXML(r io.Reader) ([]Block, error) {
 		}
 	}
 
-	for {
+	for i := 0; ; i++ {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		tok, err := dec.Token()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			// Best-effort: a malformed tail still yields the blocks parsed so far.
-			break
+			return nil, fmt.Errorf("%w: malformed docx xml: %v", ErrInvalid, err)
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:

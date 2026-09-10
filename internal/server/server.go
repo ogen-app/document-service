@@ -42,14 +42,9 @@ func New(engine *docengine.Engine, maxConcurrent int) *Server {
 // InvalidArgument/Unimplemented (the client must not retry); everything else is
 // Internal (transient).
 func (s *Server) Parse(stream documentsv1.DocumentsService_ParseServer) error {
-	// Bound concurrent extractions; respect client cancellation while queued.
-	select {
-	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
-	case <-stream.Context().Done():
-		return status.FromContextError(stream.Context().Err()).Err()
-	}
-
+	// Reassemble the upload FIRST (bounded by maxDocBytes) — do NOT hold an
+	// extraction slot while waiting on a slow/idle uploader, or idle streams could
+	// exhaust every slot.
 	var opts *documentsv1.ParseOptions
 	var data []byte
 	for {
@@ -77,7 +72,21 @@ func (s *Server) Parse(stream documentsv1.DocumentsService_ParseServer) error {
 		return status.Error(codes.InvalidArgument, "empty document")
 	}
 
-	res, err := s.engine.Extract(data, docengine.Options{
+	// Now that the bytes are in hand, acquire an extraction slot (CPU-bound work);
+	// respect client cancellation while queued.
+	ctx := stream.Context()
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	case <-ctx.Done():
+		return status.FromContextError(ctx.Err()).Err()
+	}
+
+	// Pass the stream context so a client cancellation aborts the bounded parser
+	// loops instead of running the extraction to completion for nobody.
+	res, err := s.engine.ExtractContext(ctx, data, docengine.Options{
+		Filename:     opts.GetFilename(),
+		ContentType:  opts.GetContentType(),
 		TargetChars:  int(opts.GetChunkTargetChars()),
 		OverlapChars: int(opts.GetChunkOverlapChars()),
 		MaxChars:     int(opts.GetChunkMaxChars()),

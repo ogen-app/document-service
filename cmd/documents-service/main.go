@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -59,12 +60,21 @@ func main() {
 	hs.SetServingStatus("documents.v1.DocumentsService", healthpb.HealthCheckResponse_SERVING)
 	hs.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 
+	// GracefulStop drains in-flight RPCs (e.g. an open Parse stream) before Serve
+	// returns; stopped is closed once it finishes so main waits for the drain
+	// instead of exiting mid-shutdown. A hard Stop() bounds the grace period.
+	stopped := make(chan struct{})
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
 		logger.Info("shutting down", "component", "boot")
+		go func() {
+			time.Sleep(gracePeriod)
+			srv.Stop() // force-close if graceful drain overruns the grace period
+		}()
 		srv.GracefulStop()
+		close(stopped)
 	}()
 
 	logger.Info("listening", "component", "boot", "addr", cfg.Listen, "max_concurrent", cfg.MaxConcurrent)
@@ -72,4 +82,9 @@ func main() {
 		logger.Error("serve", "component", "boot", "err", err)
 		os.Exit(1)
 	}
+	<-stopped // wait for the graceful drain to finish before exiting
 }
+
+// gracePeriod bounds how long GracefulStop may drain in-flight RPCs before a hard
+// Stop() forces shutdown.
+const gracePeriod = 25 * time.Second

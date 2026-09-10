@@ -49,7 +49,7 @@ func emlBody(contentType, cte string, r io.Reader) (string, bool) {
 		mediaType = "text/plain"
 	}
 	if strings.HasPrefix(mediaType, "multipart/") {
-		if text, isHTML, ok := multipartText(r, params["boundary"]); ok {
+		if text, isHTML, ok := multipartText(r, params["boundary"], 0); ok {
 			return text, isHTML
 		}
 		return "", false
@@ -58,10 +58,18 @@ func emlBody(contentType, cte string, r io.Reader) (string, bool) {
 	return decodeTransfer(body, cte), mediaType == "text/html"
 }
 
+// maxMultipartDepth bounds nested multipart recursion so a deeply-nested message
+// can't exhaust the stack (a DoS vector); real mail nests at most a couple levels
+// (mixed → alternative).
+const maxMultipartDepth = 8
+
 // multipartText walks the parts, returning the first text/plain (preferred) or
-// text/html body. Nested multiparts are searched one level deep.
-func multipartText(r io.Reader, boundary string) (string, bool, bool) {
-	if boundary == "" {
+// text/html body. Parts marked as attachments (Content-Disposition: attachment)
+// are skipped — the extractor contract ignores attachments, and a text/plain
+// attachment must not be mistaken for the body. Recursion is bounded by
+// maxMultipartDepth.
+func multipartText(r io.Reader, boundary string, depth int) (string, bool, bool) {
+	if boundary == "" || depth >= maxMultipartDepth {
 		return "", false, false
 	}
 	mr := multipart.NewReader(r, boundary)
@@ -71,11 +79,13 @@ func multipartText(r io.Reader, boundary string) (string, bool, bool) {
 		if err != nil {
 			break
 		}
-		ct := part.Header.Get("Content-Type")
-		mediaType, params, _ := mime.ParseMediaType(ct)
+		if isAttachment(part.Header.Get("Content-Disposition")) {
+			continue
+		}
+		mediaType, params, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
 		switch {
 		case strings.HasPrefix(mediaType, "multipart/"):
-			if text, isHTML, ok := multipartText(part, params["boundary"]); ok && !isHTML {
+			if text, isHTML, ok := multipartText(part, params["boundary"], depth+1); ok && !isHTML {
 				return text, false, true
 			} else if ok && htmlBody == "" {
 				htmlBody = text
@@ -94,6 +104,16 @@ func multipartText(r io.Reader, boundary string) (string, bool, bool) {
 		return htmlBody, true, true
 	}
 	return "", false, false
+}
+
+// isAttachment reports whether a Content-Disposition header marks the part as an
+// attachment (rather than inline body).
+func isAttachment(disposition string) bool {
+	if disposition == "" {
+		return false
+	}
+	d, _, _ := mime.ParseMediaType(disposition)
+	return strings.EqualFold(d, "attachment")
 }
 
 // decodeTransfer decodes a body per its Content-Transfer-Encoding.

@@ -14,6 +14,7 @@ import (
 // so these bounds apply to extraction.
 const (
 	maxZipEntryBytes = 300 << 20 // per-entry uncompressed cap
+	maxArchiveBytes  = 300 << 20 // aggregate uncompressed cap across a multi-part extraction (e.g. epub spine)
 	maxZipEntries    = 8192      // guards a directory of millions of tiny entries
 )
 
@@ -41,13 +42,20 @@ func zipFile(zr *zip.Reader, name string) (*zip.File, bool) {
 }
 
 // openEntry opens a member for streaming, bounded to maxZipEntryBytes so a
-// zip-bomb entry can't exhaust memory. The caller closes the result.
+// zip-bomb entry can't exhaust memory. It rejects an entry whose central-
+// directory-declared uncompressed size already exceeds the cap, and wraps the
+// stream in an overflow-detecting reader so a lying/streamed size that inflates
+// past the cap at read time surfaces as ErrInvalid rather than a silent
+// truncation. The caller closes the result.
 func openEntry(f *zip.File) (io.ReadCloser, error) {
+	if f.UncompressedSize64 > maxZipEntryBytes {
+		return nil, fmt.Errorf("%w: zip entry %q declares %d bytes (> %d cap)", ErrInvalid, f.Name, f.UncompressedSize64, maxZipEntryBytes)
+	}
 	rc, err := f.Open()
 	if err != nil {
 		return nil, err
 	}
-	return boundedReadCloser{r: io.LimitReader(rc, maxZipEntryBytes), c: rc}, nil
+	return boundedReadCloser{r: &overflowReader{r: rc, cap: maxZipEntryBytes, name: f.Name}, c: rc}, nil
 }
 
 type boundedReadCloser struct {
@@ -57,6 +65,25 @@ type boundedReadCloser struct {
 
 func (b boundedReadCloser) Read(p []byte) (int, error) { return b.r.Read(p) }
 func (b boundedReadCloser) Close() error               { return b.c.Close() }
+
+// overflowReader passes bytes through until the cumulative count exceeds cap, at
+// which point it returns ErrInvalid — so a zip entry that decompresses past the
+// cap fails loudly instead of being silently truncated (as io.LimitReader would).
+type overflowReader struct {
+	r    io.Reader
+	cap  int64
+	read int64
+	name string
+}
+
+func (o *overflowReader) Read(p []byte) (int, error) {
+	n, err := o.r.Read(p)
+	o.read += int64(n)
+	if o.read > o.cap {
+		return n, fmt.Errorf("%w: zip entry %q exceeds %d bytes", ErrInvalid, o.name, o.cap)
+	}
+	return n, err
+}
 
 // readZipEntry reads up to limit bytes of the named member as a string,
 // best-effort (empty on any error). Used for the small `mimetype` sniff.

@@ -9,6 +9,10 @@ type Block struct {
 	Level int      // heading depth (1..N) or list depth; 0 when n/a
 	Text  string   // block text (already valid UTF-8); empty for pure Cells rows
 	Cells []string // TableRow / SheetRow only — never pre-joined into Text
+	// Row is the 1-based PHYSICAL source row for SheetRow blocks (extractors skip
+	// blank rows, so this preserves the true spreadsheet row for cell ranges). 0
+	// when n/a.
+	Row int
 	// Anchor locates the block in its source. The chunker copies/refines it onto
 	// each emitted chunk (e.g. widening a page range, naming a cell range).
 	Anchor Anchor

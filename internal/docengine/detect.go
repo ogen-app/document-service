@@ -153,16 +153,19 @@ func hintFrom(opts Options) string {
 			return ext
 		}
 	}
+	// MIME types are case-insensitive (RFC 2045), so normalise before matching —
+	// e.g. "Text/CSV" must still map to .csv.
+	ct := strings.ToLower(opts.ContentType)
 	switch {
-	case strings.Contains(opts.ContentType, "csv"):
+	case strings.Contains(ct, "csv"):
 		return ".csv"
-	case strings.Contains(opts.ContentType, "tab-separated"):
+	case strings.Contains(ct, "tab-separated"):
 		return ".tsv"
-	case strings.Contains(opts.ContentType, "html"):
+	case strings.Contains(ct, "html"):
 		return ".html"
-	case strings.Contains(opts.ContentType, "rfc822"):
+	case strings.Contains(ct, "rfc822"):
 		return ".eml"
-	case strings.Contains(opts.ContentType, "rtf"):
+	case strings.Contains(ct, "rtf"):
 		return ".rtf"
 	}
 	return ""
