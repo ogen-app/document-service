@@ -1,0 +1,110 @@
+name: ci
+
+# Lint + test on every PR and push. The image is built and pushed only after
+# both test jobs (go, proto) pass, and only on main or version tags — never on
+# PRs. Requires repo secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l $(git ls-files '*.go' | grep -v '^gen/'))"
+          if [ -n "$unformatted" ]; then echo "needs gofmt:"; echo "$unformatted"; exit 1; fi
+
+      # All application logging goes through log/slog (CON-107). Boot log.Fatal*
+      # in cmd/documents-service is allowed; log.Print/Printf/Println are not.
+      - name: forbid stdlib log.Print calls
+        run: |
+          if git grep -nE 'log\.Print(ln|f)?\(' -- cmd internal; then
+            echo "::error::use log/slog, not the stdlib log.Print/Printf/Println functions"
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      # Pure Go — build the release binary exactly as the Dockerfile does.
+      - name: build (CGO-free)
+        run: CGO_ENABLED=0 go build ./...
+
+      - name: test
+        run: go test -race ./...
+
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Pin to the versions in the generated headers so regeneration is
+      # byte-identical. documents.v1 lives in buf.build/ogen-app/proto (CON-220);
+      # `make proto` requires that module version to publish documents.v1.
+      - name: Install protoc-gen-go plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Verify generated code is up to date
+        run: |
+          make proto
+          if [ -n "$(git status --porcelain -- gen/)" ]; then
+            echo "::error::gen/ is out of date — run 'make proto' and commit the result"
+            git diff -- gen/
+            exit 1
+          fi
+
+  build-push:
+    runs-on: ubuntu-latest
+    # Gate the image on tests: this job won't start until both go and proto
+    # succeed. Skip on PRs and on forks.
+    needs: [go, proto]
+    if: github.event_name == 'push' && github.repository_owner == 'ogen-app'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/document-service
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
